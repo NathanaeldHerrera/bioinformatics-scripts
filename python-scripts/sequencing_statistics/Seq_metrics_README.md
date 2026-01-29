@@ -13,7 +13,7 @@ This pipeline pulls together information from three sources:
 
 - **Qualimap** → read counts (mapped, unmapped, on-target, off-target)
 - **mosdepth** → mean depth for target regions (Capture) or genome-wide (WGS)
-- **Picard MarkDuplicates** → duplication rates and library complexity estimates
+- **Picard MarkDuplicates** → duplication rates (total, PCR, and optical) and library complexity estimates
 
 The script automatically determines which metrics to calculate based on whether you're running Capture or WGS mode.
 
@@ -141,14 +141,47 @@ You can also just omit the `--bed` flag entirely — the script will automatical
 | **Near-target(reads)** | Reads in flanking regions | Count | samtools/bedtools | Measures probe bleed-over |
 | **Near-target rate (% of mapped reads)** | Fraction in flanks | Percent | (Near-target ÷ Mapped) × 100 | Some is expected |
 | **Near-target(Mean Depth)** | Coverage in flanking regions | X | mosdepth | Usually lower than on-target |
-| **Duplication rate** | PCR/optical duplicate fraction | Percent | Picard | <10% great, >30% not great |
+| **Duplication rate (total %)** | Total duplicate fraction (PCR + optical) | Percent | Picard | <30% good, >50% concerning |
+| **PCR Dup rate (%)** | Duplicates from library prep amplification | Percent | (Total dups − Optical dups) ÷ Total reads | Main driver of duplication |
+| **Optical Dup rate (%)** | Duplicates from sequencer optics | Percent | Optical dups ÷ Total reads | Should be low (<5%) |
 | **Estimated Library Size** | Predicted unique molecules in library | Count | Picard | Higher = more complex library |
-| **Optical Duplicates** | Duplicates from sequencer optics | Count | Picard | Should be low |
+| **Optical Duplicates** | Raw count of optical duplicates | Count | Picard | Should be low |
 | **Unpaired Reads Examined** | Single-end reads checked for dups | Count | Picard | — |
 | **Read Pairs Examined** | Paired-end reads checked for dups | Count | Picard | — |
 | **Unique on-target reads** | Non-duplicate reads on targets | Count | On-target × (1 − dup rate) | **Usable data** |
 | **qualimap_txt** | Path to source Qualimap file | Path | — | For troubleshooting |
 | **mosdepth_summary** | Path to mosdepth output | Path | — | For troubleshooting |
+
+---
+
+## **Understanding Duplication Types**
+
+The script now distinguishes between two sources of duplicate reads:
+
+### **PCR Duplicates (Library Prep)**
+- **Cause:** Amplification during library preparation
+- **Identified by:** Same mapping coordinates but NOT from adjacent flowcell positions
+- **High values indicate:** Low library complexity, too many PCR cycles, or limited input DNA
+- **Fix:** Increase input DNA, reduce PCR cycles, optimize library prep
+
+### **Optical Duplicates (Sequencing Artifact)**
+- **Cause:** Single cluster incorrectly split into multiple spots during sequencing
+- **Identified by:** Same mapping coordinates AND adjacent positions on the flowcell (within pixel distance threshold)
+- **High values indicate:** Flowcell overclustering, patterned flowcell issues
+- **Fix:** Adjust cluster density, check sequencing QC
+
+### **Interpreting the Relationship**
+
+```
+Total Duplication = PCR Duplication + Optical Duplication
+```
+
+| Scenario | PCR Dup | Optical Dup | Interpretation |
+|----------|---------|-------------|----------------|
+| Normal | 25-35% | 1-3% | Typical for museum specimens |
+| Low complexity | 45%+ | 1-3% | Need more input DNA |
+| Sequencing issue | 20% | 10%+ | Check flowcell/clustering |
+| Both problems | 40%+ | 8%+ | Multiple issues to address |
 
 ---
 
@@ -163,14 +196,81 @@ WGS mode produces a simpler output since on-target/off-target concepts don't app
 | **Total Mapped(reads)** | Reads aligned to genome | Count | Qualimap | — |
 | **Mapping rate (%)** | What fraction of reads aligned | Percent | (Mapped ÷ Total) × 100 | ≥95% typical for good data |
 | **Mean Genome Depth** | Average coverage across genome | X | mosdepth | Higher is better |
-| **Duplication rate** | PCR/optical duplicate fraction | Percent | Picard | <10% great, >30% not great |
+| **Duplication rate (total %)** | Total duplicate fraction | Percent | Picard | <30% good, >50% concerning |
+| **PCR Dup rate (%)** | Duplicates from library prep | Percent | Calculated | Main driver of duplication |
+| **Optical Dup rate (%)** | Duplicates from sequencer optics | Percent | Calculated | Should be low (<5%) |
 | **Estimated Library Size** | Predicted unique molecules | Count | Picard | Higher = more complex library |
-| **Optical Duplicates** | Duplicates from sequencer optics | Count | Picard | Should be low |
+| **Optical Duplicates** | Raw count of optical duplicates | Count | Picard | Should be low |
 | **Unpaired Reads Examined** | Single-end reads checked | Count | Picard | — |
 | **Read Pairs Examined** | Paired-end reads checked | Count | Picard | — |
 | **Unique mapped reads** | Non-duplicate mapped reads | Count | Mapped × (1 − dup rate) | **Usable data** |
 | **qualimap_txt** | Path to source file | Path | — | For troubleshooting |
 | **mosdepth_summary** | Path to mosdepth output | Path | — | For troubleshooting |
+
+---
+
+## **Plot Output (`--plot`)**
+
+When you use the `--plot` flag, the script generates a 2×2 figure with four panels analyzing duplication patterns across your samples:
+
+### **Panel Layout**
+
+| Position | Plot | What It Shows |
+|----------|------|---------------|
+| **Top-left** | Duplication vs Sequencing Depth | Duplication rate (%) vs total mapped reads (millions) |
+| **Top-right** | Duplication vs Coverage | Duplication rate (%) vs mean depth (on-target for Capture, genome-wide for WGS) |
+| **Bottom-left** | Duplication vs Library Complexity | Duplication rate (%) vs estimated library size (millions) |
+| **Bottom-right** | Duplication Distribution | Histogram of duplication rates across all samples |
+
+### **What to Look For**
+
+**Top-left (Duplication vs Sequencing Depth):**  
+Shows whether deeper sequencing is driving up duplication. A strong positive correlation (high r value) suggests you're over-sequencing relative to your library complexity — sequencing more won't give you much new data.
+
+**Top-right (Duplication vs Coverage):**  
+Similar to above, but uses actual coverage depth rather than read counts. Helps identify if samples with high coverage are hitting diminishing returns.
+
+**Bottom-left (Duplication vs Library Complexity):**  
+Samples with smaller estimated library sizes should have higher duplication. If you see samples with large libraries but still high duplication, something else may be going on (e.g., optical duplicates, over-amplification).
+
+**Bottom-right (Duplication Distribution):**  
+Quick overview of how your samples are distributed. The red dashed line shows the median, orange shows the mean. A tight distribution means consistent library prep; a wide spread or outliers may warrant investigation.
+
+---
+
+## **Troubleshooting High Duplication**
+
+### **Step 1: Check the Breakdown**
+
+Look at `PCR Dup rate (%)` vs `Optical Dup rate (%)`:
+
+- **High PCR, Low Optical** → Library complexity issue
+- **Low PCR, High Optical** → Sequencing/clustering issue  
+- **Both High** → Multiple problems
+
+### **Step 2: Check Library Size**
+
+The `Estimated Library Size` column tells you how many unique molecules Picard thinks are in your library:
+
+- **<1 million** → Very low complexity, expect high duplication
+- **1-5 million** → Moderate complexity, typical for degraded samples
+- **>5 million** → Good complexity
+
+### **Step 3: Review the Plot**
+
+The correlation between duplication and library size (bottom-left panel) should be negative (r ≈ -0.3 to -0.5). If it's flat or positive, something unusual is happening.
+
+---
+
+## **Version History**
+
+| Version | Changes |
+|---------|---------|
+| v5 | Added PCR vs Optical duplicate breakdown; improved near-target counting with samtools fallback; added timeout handling for large BAMs |
+| v4 | Added robust near-target counting with samtools primary, bedtools fallback |
+| v3 | Added Estimated Library Size, Optical Duplicates, read pair metrics |
+| v2 | Added duplication analysis plotting |
+| v1 | Initial release with basic Capture metrics |
 
 ---
 
