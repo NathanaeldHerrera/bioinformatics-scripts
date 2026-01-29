@@ -238,30 +238,6 @@ Quick overview of how your samples are distributed. The red dashed line shows th
 
 ---
 
-## **Troubleshooting High Duplication**
-
-### **Step 1: Check the Breakdown**
-
-Look at `PCR Dup rate (%)` vs `Optical Dup rate (%)`:
-
-- **High PCR, Low Optical** → Library complexity issue
-- **Low PCR, High Optical** → Sequencing/clustering issue  
-- **Both High** → Multiple problems
-
-### **Step 2: Check Library Size**
-
-The `Estimated Library Size` column tells you how many unique molecules Picard thinks are in your library:
-
-- **<1 million** → Very low complexity, expect high duplication
-- **1-5 million** → Moderate complexity, typical for degraded samples
-- **>5 million** → Good complexity
-
-### **Step 3: Review the Plot**
-
-The correlation between duplication and library size (bottom-left panel) should be negative (r ≈ -0.3 to -0.5). If it's flat or positive, something unusual is happening.
-
----
-
 ## **Version History**
 
 | Version | Changes |
