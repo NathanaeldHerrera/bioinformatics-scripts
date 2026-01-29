@@ -1,30 +1,12 @@
 #!/usr/bin/env python3
 """
-Summarize sequencing metrics for either Sequence Capture or Whole Genome Sequencing (WGS).
-
-CAPTURE MODE (default when --bed is provided):
+Summarize capture performance:
 - Reads (Qualimap): total, mapped, on-target, off-target
 - Rates as percentages: On-target, Off-target, Near-target (all % of mapped reads), plus On-target (% of total reads)
 - Fold enrichment (on-target rate vs genome fraction targeted)
 - On-target mean depth (mosdepth)
 - Near-target mean depth (mosdepth on flank-only BED, Picard-style)
 - Duplication rate (Picard MarkDuplicates) and Unique on-target reads
-
-WGS MODE (when --wgs flag is used or no --bed is provided):
-- Reads (Qualimap): total, mapped, unmapped
-- Mean genome-wide depth (mosdepth)
-- Duplication rate (Picard MarkDuplicates) and Unique mapped reads
-- No on-target/off-target metrics (not applicable for WGS)
-
-Usage examples:
-Capture mode
-python summarize_seq_metrics_v5.py -r /path/to/qualimap -b targets.bed --genome-fai ref.fai -o capture_summary.csv
-
-WGS mode (needs explicit flag)
-python summarize_seq_metrics_v5.py -r /path/to/qualimap --wgs --genome-fai ref.fai -o wgs_summary.csv
-
-WGS mode (auto-detect when no BED provided)
-python summarize_seq_metrics_v5.py -r /path/to/qualimap --genome-fai ref.fai -o wgs_summary.csv
 
 Author: Nathanael Herrera
 Contact: ndh04c@gmail.com
@@ -57,16 +39,14 @@ def parse_genome_results(txt: Path):
     Parse Qualimap genome_results.txt for read counts.
     Uses sections:
       >>>>>>> Globals
-      >>>>>>> Globals inside (only for capture mode)
-      >>>>>>> Coverage (for mean coverage in WGS mode)
+      >>>>>>> Globals inside
     """
     rec = {
         "sample": None,
         "bam": None,
         "reads_total": None,
         "reads_mapped": None,
-        "reads_inside": None,  # Only populated for capture mode
-        "mean_coverage": None,  # For WGS mode from Qualimap
+        "reads_inside": None,
     }
     section = None
     for line in txt.read_text().splitlines():
@@ -91,12 +71,6 @@ def parse_genome_results(txt: Path):
             m3 = re.search(r"number of mapped reads\s*=\s*([\d,]+)", line, re.IGNORECASE)
             if m3 and rec["reads_inside"] is None:
                 rec["reads_inside"] = int(m3.group(1).replace(",", ""))
-
-        # Parse mean coverage from Qualimap (useful for WGS mode)
-        if section == "coverage":
-            m4 = re.search(r"mean coverageData\s*=\s*([\d.,]+)", line, re.IGNORECASE)
-            if m4 and rec["mean_coverage"] is None:
-                rec["mean_coverage"] = float(m4.group(1).replace(",", ""))
 
     return rec
 
@@ -211,52 +185,6 @@ def find_or_run_mosdepth(bam: str, bed: str, cache_dir: Path, sample_prefix: str
     return None
 
 
-def find_or_run_mosdepth_wgs(bam: str, cache_dir: Path, sample_prefix: str, force: bool) -> Path | None:
-    """
-    Run mosdepth in WGS mode (without BED file) to get genome-wide coverage.
-    Use cached <cache_dir>/<sample_prefix>_wgs.mosdepth.summary.txt if present (and not forced).
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    out_prefix = cache_dir / f"{sample_prefix}_wgs"
-    summary_path = Path(f"{out_prefix}.mosdepth.summary.txt")
-
-    if summary_path.exists() and summary_path.stat().st_size == 0:
-        summary_path.unlink(missing_ok=True)
-
-    if summary_path.exists() and not force:
-        return summary_path
-
-    def run_cmd(cmd):
-        print("[mosdepth-wgs]", " ".join(cmd))
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            if summary_path.exists() and summary_path.stat().st_size == 0:
-                summary_path.unlink(missing_ok=True)
-            print(f"[mosdepth-wgs][stderr for {sample_prefix}]\n{res.stderr.strip()}")
-            raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
-        return True
-
-    # For WGS, run mosdepth without --by (no BED file)
-    try:
-        run_cmd(["mosdepth", "--fast-mode", str(out_prefix), bam])
-        if summary_path.exists() and summary_path.stat().st_size > 0:
-            return summary_path
-    except subprocess.CalledProcessError:
-        print(f"[mosdepth-wgs] fast-mode failed for {sample_prefix}; retrying without --fast-mode...")
-
-    try:
-        run_cmd(["mosdepth", str(out_prefix), bam])
-        if summary_path.exists() and summary_path.stat().st_size > 0:
-            return summary_path
-    except subprocess.CalledProcessError:
-        print(f"[mosdepth-wgs] FAILED for {sample_prefix}. Skipping.")
-        return None
-
-    if summary_path.exists() and summary_path.stat().st_size == 0:
-        summary_path.unlink(missing_ok=True)
-    return None
-
-
 def fallback_regions_mean_from_bedgz(summary_path: Path):
     """
     Fallback: compute mean depth from <prefix>.regions.bed.gz
@@ -287,58 +215,6 @@ def fallback_regions_mean_from_bedgz(summary_path: Path):
     if tot_len > 0:
         return tot_len, (tot_cov / tot_len)
     return None, None
-
-
-def parse_mosdepth_summary_wgs(summary_txt: Path):
-    """
-    Parse mosdepth summary for WGS mode (no BED file).
-    Returns the genome-wide mean depth from the 'total' row.
-    """
-    import re as _re
-    if not summary_txt or not summary_txt.exists():
-        return None
-
-    with summary_txt.open() as fh:
-        lines = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-
-    if not lines:
-        return None
-
-    # Per-chrom format (with header)
-    first = _re.split(r'[\t, ]+', lines[0])
-    if first and first[0].lower() in {"chrom", "contig"}:
-        rows = [_re.split(r'[\t, ]+', ln) for ln in lines[1:]]
-        tot_len = tot_cov = 0
-        for parts in rows:
-            if len(parts) < 4:
-                continue
-            label = parts[0]
-            # Skip _region rows (capture-specific)
-            if label.endswith("_region"):
-                continue
-            try:
-                length = int(float(parts[1]))
-                mean = float(parts[3])
-            except ValueError:
-                continue
-            tot_len += length
-            tot_cov += mean * length
-        if tot_len > 0:
-            return tot_cov / tot_len
-        return None
-
-    # Classic 'total' label format
-    for ln in lines:
-        parts = _re.split(r'[\t, ]+', ln)
-        if len(parts) < 4:
-            continue
-        label = parts[0].lower()
-        if label == "total":
-            try:
-                return float(parts[3])
-            except ValueError:
-                continue
-    return None
 
 
 # ---------------------------- Picard metrics ----------------------------- #
@@ -583,43 +459,18 @@ def count_reads_in_bed(bam: Path, bed: Path, timeout: int = 600) -> int | None:
 # ---------------------------- Per-sample processing ---------------------- #
 
 def process_one(gr_path: Path,
-                bed: Path | None,
+                bed: Path,
                 bam_dir: Path | None,
                 cache_dir: Path,
                 force: bool,
                 picard_dir: Path | None,
                 near_bed: Path | None,
-                timeout: int = 600,
-                wgs_mode: bool = False):
-    """Process a single genome_results*.txt → summary row dict or None.
-    
-    Args:
-        gr_path: Path to Qualimap genome_results.txt
-        bed: Path to targets BED file (required for capture mode, None for WGS)
-        bam_dir: Optional directory containing final deduped BAMs
-        cache_dir: Directory for mosdepth cache
-        force: Force re-running mosdepth
-        picard_dir: Directory containing Picard MarkDuplicates metrics
-        near_bed: Flank-only BED for near-target metrics (capture mode only)
-        timeout: Timeout for near-target read counting
-        wgs_mode: If True, skip on-target/off-target calculations
-    """
+                timeout: int = 600):
+    """Process a single genome_results*.txt → summary row dict or None."""
     rec = parse_genome_results(gr_path)
-    
-    # For WGS mode, we don't need reads_inside
-    if wgs_mode:
-        needed = [rec["bam"], rec["sample"], rec["reads_total"], rec["reads_mapped"]]
-    else:
-        needed = [rec["bam"], rec["sample"], rec["reads_total"], rec["reads_mapped"], rec["reads_inside"]]
-    
+    needed = [rec["bam"], rec["sample"], rec["reads_total"], rec["reads_mapped"], rec["reads_inside"]]
     if not all(needed):
-        missing = []
-        if not rec["bam"]: missing.append("bam")
-        if not rec["sample"]: missing.append("sample")
-        if not rec["reads_total"]: missing.append("reads_total")
-        if not rec["reads_mapped"]: missing.append("reads_mapped")
-        if not wgs_mode and not rec["reads_inside"]: missing.append("reads_inside")
-        print(f"[warn] Skipping {gr_path} (missing required fields: {', '.join(missing)})")
+        print(f"[warn] Skipping {gr_path} (missing required fields)")
         return None
 
     # Resolve BAM path via --bam-dir if provided
@@ -631,141 +482,128 @@ def process_one(gr_path: Path,
         return None
 
     unmapped = rec["reads_total"] - rec["reads_mapped"]
-    
-    # Duplication rate (Picard) - common to both modes
+    on_reads = rec["reads_inside"]
+    off_reads = rec["reads_mapped"] - rec["reads_inside"]
+
+    # Rates (fractions)
+    on_rate = (on_reads / rec["reads_mapped"]) if rec["reads_mapped"] else None
+    off_rate = (off_reads / rec["reads_mapped"]) if rec["reads_mapped"] else None
+    pct_total_on = (on_reads / rec["reads_total"] * 100) if rec["reads_total"] else None
+
+    # Duplication rate (Picard)
     dup_rate, est_lib_size, picard_metrics = (None, None, None)
     if picard_dir:
         dup_rate, est_lib_size, picard_metrics = parse_picard_dup_rate(picard_dir, rec["sample"])
-    est_lib_size_val = est_lib_size
+    unique_on_reads = (on_reads * (1 - dup_rate)) if (dup_rate is not None) else None
+    est_lib_size_val = est_lib_size  # Store for row output
     
-    # Extract additional Picard metrics if available
+    # Extract additional Picard metrics and calculate PCR vs optical duplication
     optical_dups = None
     unpaired_examined = None
     pairs_examined = None
+    unpaired_dups = None
+    pair_dups = None
+    pcr_dup_rate = None
+    optical_dup_rate = None
+    
     if picard_metrics:
         optical_dups = picard_metrics.get('optical_dups')
         unpaired_examined = picard_metrics.get('unpaired_examined')
         pairs_examined = picard_metrics.get('pairs_examined')
+        unpaired_dups = picard_metrics.get('unpaired_dups')
+        pair_dups = picard_metrics.get('pair_dups')
+        
+        # Calculate optical and PCR duplicate rates
+        # Total reads examined = unpaired + (pairs * 2)
+        # Total duplicates = unpaired_dups + (pair_dups * 2)
+        # Optical duplicates only counted for pairs (READ_PAIR_OPTICAL_DUPLICATES)
+        if unpaired_examined is not None and pairs_examined is not None:
+            total_examined = unpaired_examined + (pairs_examined * 2)
+            
+            if total_examined > 0:
+                # Optical duplicate rate (optical dups * 2 because they're pairs)
+                if optical_dups is not None:
+                    optical_dup_rate = (optical_dups * 2) / total_examined
+                
+                # PCR duplicates = total duplicates - optical duplicates
+                if unpaired_dups is not None and pair_dups is not None and optical_dups is not None:
+                    total_dups = unpaired_dups + (pair_dups * 2)
+                    optical_dups_as_reads = optical_dups * 2
+                    pcr_dups = total_dups - optical_dups_as_reads
+                    pcr_dup_rate = pcr_dups / total_examined
 
-    if wgs_mode:
-        # ======================== WGS MODE ========================
-        # Get genome-wide mean depth (mosdepth without BED)
-        wgs_md_summary = find_or_run_mosdepth_wgs(
-            bam=str(bam_path), cache_dir=cache_dir, sample_prefix=rec["sample"], force=force
+    # On-target mean depth (mosdepth on targets BED)
+    on_md_summary = find_or_run_mosdepth(
+        bam=str(bam_path), bed=str(bed), cache_dir=cache_dir, sample_prefix=rec["sample"], force=force
+    )
+    on_mean = None
+    if on_md_summary and on_md_summary.exists():
+        _, _, _, reg_mean = parse_mosdepth_summary(on_md_summary)
+        if reg_mean is None:
+            _, fallback_mean = fallback_regions_mean_from_bedgz(on_md_summary)
+            on_mean = fallback_mean
+        else:
+            on_mean = reg_mean
+
+    # Near-target: reads (via samtools/bedtools) & mean depth (mosdepth on flank-only BED)
+    near_reads = None
+    near_rate = None
+    near_mean = None
+    if near_bed and near_bed.exists():
+        near_reads = count_reads_in_bed(bam_path, near_bed, timeout=timeout)
+        if near_reads is not None and rec["reads_mapped"]:
+            near_rate = near_reads / rec["reads_mapped"]
+
+        near_md_summary = find_or_run_mosdepth(
+            bam=str(bam_path), bed=str(near_bed), cache_dir=cache_dir, sample_prefix=f"{rec['sample']}_near", force=force
         )
-        genome_mean_depth = None
-        if wgs_md_summary and wgs_md_summary.exists():
-            genome_mean_depth = parse_mosdepth_summary_wgs(wgs_md_summary)
-        
-        # Fallback to Qualimap mean coverage if mosdepth failed
-        if genome_mean_depth is None and rec.get("mean_coverage") is not None:
-            genome_mean_depth = rec["mean_coverage"]
-            print(f"[info] Using Qualimap mean coverage for {rec['sample']}")
-        
-        # Calculate unique mapped reads
-        unique_mapped_reads = (rec["reads_mapped"] * (1 - dup_rate)) if (dup_rate is not None) else None
-        
-        # Assemble WGS row
-        row = {
-            "sample": rec["sample"],
-            "Unmapped(reads)": unmapped,
-            "Total Mapped(reads)": rec["reads_mapped"],
-            "Mapping rate (%)": f"{(rec['reads_mapped'] / rec['reads_total'] * 100):.2f}" if rec["reads_total"] else "",
-            "Mean Genome Depth": f"{genome_mean_depth:.6f}" if genome_mean_depth is not None else "",
-            "Duplication rate": f"{dup_rate * 100:.2f}" if dup_rate is not None else "",
-            "Estimated Library Size": f"{est_lib_size_val}" if est_lib_size_val is not None else "",
-            "Optical Duplicates": f"{optical_dups}" if optical_dups is not None else "",
-            "Unpaired Reads Examined": f"{unpaired_examined}" if unpaired_examined is not None else "",
-            "Read Pairs Examined": f"{pairs_examined}" if pairs_examined is not None else "",
-            "Unique mapped reads": f"{unique_mapped_reads:.0f}" if unique_mapped_reads is not None else "",
-            "qualimap_txt": str(gr_path),
-            "mosdepth_summary": str(wgs_md_summary) if wgs_md_summary else "",
-        }
-        return row
-    
-    else:
-        # ======================== CAPTURE MODE ========================
-        on_reads = rec["reads_inside"]
-        off_reads = rec["reads_mapped"] - rec["reads_inside"]
-
-        # Rates (fractions)
-        on_rate = (on_reads / rec["reads_mapped"]) if rec["reads_mapped"] else None
-        off_rate = (off_reads / rec["reads_mapped"]) if rec["reads_mapped"] else None
-        pct_total_on = (on_reads / rec["reads_total"] * 100) if rec["reads_total"] else None
-
-        unique_on_reads = (on_reads * (1 - dup_rate)) if (dup_rate is not None) else None
-
-        # On-target mean depth (mosdepth on targets BED)
-        on_md_summary = find_or_run_mosdepth(
-            bam=str(bam_path), bed=str(bed), cache_dir=cache_dir, sample_prefix=rec["sample"], force=force
-        )
-        on_mean = None
-        if on_md_summary and on_md_summary.exists():
-            _, _, _, reg_mean = parse_mosdepth_summary(on_md_summary)
-            if reg_mean is None:
-                _, fallback_mean = fallback_regions_mean_from_bedgz(on_md_summary)
-                on_mean = fallback_mean
+        if near_md_summary and near_md_summary.exists():
+            _, _, _, near_reg_mean = parse_mosdepth_summary(near_md_summary)
+            if near_reg_mean is None:
+                _, near_fallback_mean = fallback_regions_mean_from_bedgz(near_md_summary)
+                near_mean = near_fallback_mean
             else:
-                on_mean = reg_mean
+                near_mean = near_reg_mean
 
-        # Near-target: reads (via samtools/bedtools) & mean depth (mosdepth on flank-only BED)
-        near_reads = None
-        near_rate = None
-        near_mean = None
-        if near_bed and near_bed.exists():
-            near_reads = count_reads_in_bed(bam_path, near_bed, timeout=timeout)
-            if near_reads is not None and rec["reads_mapped"]:
-                near_rate = near_reads / rec["reads_mapped"]
-
-            near_md_summary = find_or_run_mosdepth(
-                bam=str(bam_path), bed=str(near_bed), cache_dir=cache_dir, sample_prefix=f"{rec['sample']}_near", force=force
-            )
-            if near_md_summary and near_md_summary.exists():
-                _, _, _, near_reg_mean = parse_mosdepth_summary(near_md_summary)
-                if near_reg_mean is None:
-                    _, near_fallback_mean = fallback_regions_mean_from_bedgz(near_md_summary)
-                    near_mean = near_fallback_mean
-                else:
-                    near_mean = near_reg_mean
-
-        # Assemble capture row (format percentages here)
-        row = {
-            "sample": rec["sample"],
-            "Unmapped(reads)": unmapped,
-            "Total Mapped(reads)": rec["reads_mapped"],
-            "On-target(reads)": on_reads,
-            "Off-target(reads)": off_reads,
-            "On-target rate (% of mapped reads)": f"{on_rate * 100:.2f}" if on_rate is not None else "",
-            "Off-target rate (% of mapped reads)": f"{off_rate * 100:.2f}" if off_rate is not None else "",
-            "On-target (% of Total Reads)": f"{pct_total_on:.2f}" if pct_total_on is not None else "",
-            "Fold enrichment": "",  # filled later after genome/target lengths are known
-            "On-target(Mean Depth)": f"{on_mean:.6f}" if on_mean is not None else "",
-            "Near-target(reads)": f"{near_reads}" if near_reads is not None else "",
-            "Near-target rate (% of mapped reads)": f"{near_rate * 100:.2f}" if near_rate is not None else "",
-            "Near-target(Mean Depth)": f"{near_mean:.6f}" if near_mean is not None else "",
-            "Duplication rate": f"{dup_rate * 100:.2f}" if dup_rate is not None else "",
-            "Estimated Library Size": f"{est_lib_size_val}" if est_lib_size_val is not None else "",
-            "Optical Duplicates": f"{optical_dups}" if optical_dups is not None else "",
-            "Unpaired Reads Examined": f"{unpaired_examined}" if unpaired_examined is not None else "",
-            "Read Pairs Examined": f"{pairs_examined}" if pairs_examined is not None else "",
-            "Unique on-target reads": f"{unique_on_reads:.0f}" if unique_on_reads is not None else "",
-            "qualimap_txt": str(gr_path),
-            "mosdepth_summary": str(on_md_summary) if on_md_summary else "",
-        }
-        return row
+    # Assemble row (format percentages here)
+    row = {
+        "sample": rec["sample"],
+        "Unmapped(reads)": unmapped,
+        "Total Mapped(reads)": rec["reads_mapped"],
+        "On-target(reads)": on_reads,
+        "Off-target(reads)": off_reads,
+        "On-target rate (% of mapped reads)": f"{on_rate * 100:.2f}" if on_rate is not None else "",
+        "Off-target rate (% of mapped reads)": f"{off_rate * 100:.2f}" if off_rate is not None else "",
+        "On-target (% of Total Reads)": f"{pct_total_on:.2f}" if pct_total_on is not None else "",
+        "Fold enrichment": "",  # filled later after genome/target lengths are known
+        "On-target(Mean Depth)": f"{on_mean:.6f}" if on_mean is not None else "",
+        "Near-target(reads)": f"{near_reads}" if near_reads is not None else "",
+        "Near-target rate (% of mapped reads)": f"{near_rate * 100:.2f}" if near_rate is not None else "",
+        "Near-target(Mean Depth)": f"{near_mean:.6f}" if near_mean is not None else "",
+        "Duplication rate (total %)": f"{dup_rate * 100:.2f}" if dup_rate is not None else "",
+        "PCR Dup rate (%)": f"{pcr_dup_rate * 100:.2f}" if pcr_dup_rate is not None else "",
+        "Optical Dup rate (%)": f"{optical_dup_rate * 100:.2f}" if optical_dup_rate is not None else "",
+        "Estimated Library Size": f"{est_lib_size_val}" if est_lib_size_val is not None else "",
+        "Optical Duplicates": f"{optical_dups}" if optical_dups is not None else "",
+        "Unpaired Reads Examined": f"{unpaired_examined}" if unpaired_examined is not None else "",
+        "Read Pairs Examined": f"{pairs_examined}" if pairs_examined is not None else "",
+        "Unique on-target reads": f"{unique_on_reads:.0f}" if unique_on_reads is not None else "",
+        "qualimap_txt": str(gr_path),
+        "mosdepth_summary": str(on_md_summary) if on_md_summary else "",
+    }
+    return row
 
 
 # ----------------------------- Plotting -------------------------------- #
 
-def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool = False):
+def generate_dup_vs_depth_plot(rows: list, output_path: str, plt):
     """
     Generate a scatter plot of duplication rate vs sequencing depth.
     
     Plots:
     1. Duplication rate (%) vs Total Mapped Reads (sequencing depth proxy)
     2. Duplication rate (%) vs Estimated Library Size (if available)
-    3. Duplication rate (%) vs Mean Depth (On-target for capture, Genome-wide for WGS)
-    4. Distribution of duplication rates (histogram)
+    3. Duplication rate (%) vs On-target Mean Depth
     
     Also fits a simple trend line to help visualize the relationship.
     """
@@ -776,18 +614,17 @@ def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool
     dup_rates = []
     mapped_reads = []
     lib_sizes = []
-    mean_depths = []
-    
-    # Determine which depth column to use
-    depth_col = "Mean Genome Depth" if wgs_mode else "On-target(Mean Depth)"
+    on_target_depths = []
     
     for r in rows:
         try:
-            dup = float(r.get("Duplication rate", "") or "nan")
+            # Try both old and new column names for backward compatibility
+            dup_str = r.get("Duplication rate (total %)", "") or r.get("Duplication rate", "") or ""
+            dup = float(dup_str) if dup_str else float("nan")
             mapped = int(r.get("Total Mapped(reads)", 0))
             lib_size_str = r.get("Estimated Library Size", "")
             lib_size = int(lib_size_str) if lib_size_str else None
-            depth_str = r.get(depth_col, "")
+            depth_str = r.get("On-target(Mean Depth)", "")
             depth = float(depth_str) if depth_str else None
             
             if dup == dup and mapped > 0:  # NaN check
@@ -795,7 +632,7 @@ def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool
                 dup_rates.append(dup)
                 mapped_reads.append(mapped)
                 lib_sizes.append(lib_size)
-                mean_depths.append(depth)
+                on_target_depths.append(depth)
         except (ValueError, TypeError):
             continue
     
@@ -805,8 +642,7 @@ def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool
     
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    mode_label = "WGS" if wgs_mode else "Capture"
-    fig.suptitle(f'Duplication Rate Analysis ({mode_label} Mode)', fontsize=14, fontweight='bold')
+    fig.suptitle('Duplication Rate Analysis', fontsize=14, fontweight='bold')
     
     # Plot 1: Duplication vs Total Mapped Reads
     ax1 = axes[0, 0]
@@ -832,18 +668,16 @@ def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool
              verticalalignment='top', fontsize=10, 
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # Plot 2: Duplication vs Mean Depth (On-target or Genome-wide depending on mode)
+    # Plot 2: Duplication vs On-target Mean Depth
     ax2 = axes[0, 1]
-    valid_depths = [(d, dup) for d, dup in zip(mean_depths, dup_rates) if d is not None]
-    depth_label = "Mean Genome Depth (X)" if wgs_mode else "On-target Mean Depth (X)"
-    title_label = "Duplication Rate vs Genome Coverage" if wgs_mode else "Duplication Rate vs On-target Coverage"
+    valid_depths = [(d, dup) for d, dup in zip(on_target_depths, dup_rates) if d is not None]
     if valid_depths:
         depths_arr = np.array([x[0] for x in valid_depths])
         dups_arr = np.array([x[1] for x in valid_depths])
         ax2.scatter(depths_arr, dups_arr, alpha=0.6, edgecolors='black', linewidth=0.5, color='green')
-        ax2.set_xlabel(depth_label)
+        ax2.set_xlabel('On-target Mean Depth (X)')
         ax2.set_ylabel('Duplication Rate (%)')
-        ax2.set_title(title_label)
+        ax2.set_title('Duplication Rate vs On-target Coverage')
         ax2.grid(True, alpha=0.3)
         
         if len(depths_arr) > 1:
@@ -905,27 +739,16 @@ def generate_dup_vs_depth_plot(rows: list, output_path: str, plt, wgs_mode: bool
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Summarize sequencing metrics for Capture or WGS data from Qualimap, mosdepth, and Picard.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Capture mode (requires --bed)
-  %(prog)s -r /path/to/qualimap -b targets.bed --genome-fai ref.fai -o capture_summary.csv
-
-  # WGS mode (no BED file needed)
-  %(prog)s -r /path/to/qualimap --wgs --genome-fai ref.fai -o wgs_summary.csv
-"""
+        description="Summarize capture enrichment metrics from Qualimap, mosdepth (targets & flank), and Picard."
     )
     ap.add_argument("-r", "--root", required=True,
                     help="Root dir to search recursively for genome_results*.txt (follows symlinks)")
-    ap.add_argument("-b", "--bed", default=None,
-                    help="Targets BED file used for mosdepth (required for capture mode, ignored in WGS mode)")
-    ap.add_argument("--wgs", action="store_true",
-                    help="WGS mode: skip on-target/off-target metrics (no BED file needed)")
+    ap.add_argument("-b", "--bed", required=True,
+                    help="Targets BED file used for mosdepth")
     ap.add_argument("--near-bed", default=None,
-                    help="Flank-only BED (Picard-style near-target regions, excludes targets; capture mode only)")
+                    help="Flank-only BED (Picard-style near-target regions, excludes targets)")
     ap.add_argument("--genome-fai", required=True,
-                    help="Reference .fai file (for genome size; also used to clip+union BED for fold enrichment in capture mode)")
+                    help="Reference .fai file (for genome size; also used to clip+union BED for fold enrichment)")
     ap.add_argument("--picard-dir", default=None,
                     help="Directory containing <sample>_dedupe_metrics.txt (Picard MarkDuplicates metrics)")
     ap.add_argument("-c", "--cache-dir", default="mosdepth_summaries",
@@ -938,39 +761,24 @@ Examples:
                     help="Number of samples to process in parallel (default: 4)")
     ap.add_argument("--timeout", type=int, default=600,
                     help="Timeout in seconds for near-target read counting per sample (default: 600)")
-    ap.add_argument("-o", "--out", default="sequencing_summary.csv",
-                    help="Output CSV path (default: sequencing_summary.csv)")
+    ap.add_argument("-o", "--out", default="qualimap_targets_summary.csv",
+                    help="Output CSV path")
     ap.add_argument("--plot", default=None,
                     help="Generate duplication vs sequencing depth plot (PNG output path)")
     args = ap.parse_args()
 
-    # Determine mode
-    wgs_mode = args.wgs or (args.bed is None)
-    
-    if not wgs_mode and args.bed is None:
-        ap.error("Capture mode requires --bed. Use --wgs for whole genome sequencing mode.")
-    
-    if wgs_mode:
-        print("[mode] Running in WGS mode (no on-target/off-target metrics)")
-    else:
-        print("[mode] Running in Capture mode")
-
     root = Path(args.root).resolve()
-    bed = Path(args.bed) if args.bed else None
-    near_bed = Path(args.near_bed).resolve() if args.near_bed and not wgs_mode else None
+    bed = Path(args.bed)
+    near_bed = Path(args.near_bed).resolve() if args.near_bed else None
     cache_dir = Path(args.cache_dir)
     bam_dir = Path(args.bam_dir).resolve() if args.bam_dir else None
     picard_dir = Path(args.picard_dir).resolve() if args.picard_dir else None
 
-    # Genome size from FAI (needed for both modes)
+    # Genome & target bp for enrichment
     fai = Path(args.genome_fai)
     sizes = load_chrom_sizes(fai)
     genome_bp = sum(sizes.values())
-    
-    # Target bp only needed for capture mode (for fold enrichment)
-    target_bp = None
-    if not wgs_mode and bed:
-        target_bp = bed_union_length(bed, chrom_sizes=sizes)
+    target_bp = bed_union_length(bed, chrom_sizes=sizes)  # union length (clipped to FAI)
 
     # Gather Qualimap results (follow symlinks)
     qualimap_txts = []
@@ -990,7 +798,7 @@ Examples:
     rows = []
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
         futures = [
-            ex.submit(process_one, gr, bed, bam_dir, cache_dir, args.force, picard_dir, near_bed, args.timeout, wgs_mode)
+            ex.submit(process_one, gr, bed, bam_dir, cache_dir, args.force, picard_dir, near_bed, args.timeout)
             for gr in qualimap_txts
         ]
         for fut in as_completed(futures):
@@ -998,42 +806,30 @@ Examples:
             if row:
                 rows.append(row)
 
-    # Add enrichment columns (capture mode only)
-    if not wgs_mode:
-        for r in rows:
-            try:
-                on_rate_pct = float(r.get("On-target rate (% of mapped reads)", "") or "nan")
-                on_rate_frac = on_rate_pct / 100.0 if on_rate_pct == on_rate_pct else float("nan")  # NaN check
-            except ValueError:
-                on_rate_frac = float("nan")
-            denom = (target_bp / genome_bp) if (genome_bp > 0 and target_bp) else float("nan")
-            fold = (on_rate_frac / denom) if (denom and denom > 0) else float("nan")
-            r["Fold enrichment"] = f"{fold:.3f}" if (fold == fold) else ""  # NaN check
-
-    # Define columns based on mode
-    if wgs_mode:
-        cols = [
-            "sample",
-            "Unmapped(reads)", "Total Mapped(reads)", "Mapping rate (%)",
-            "Mean Genome Depth",
-            "Duplication rate", "Estimated Library Size", "Optical Duplicates",
-            "Unpaired Reads Examined", "Read Pairs Examined", "Unique mapped reads",
-            "qualimap_txt", "mosdepth_summary",
-        ]
-    else:
-        cols = [
-            "sample",
-            "Unmapped(reads)", "Total Mapped(reads)", "On-target(reads)", "Off-target(reads)",
-            "On-target rate (% of mapped reads)", "Off-target rate (% of mapped reads)",
-            "On-target (% of Total Reads)", "Fold enrichment",
-            "On-target(Mean Depth)",
-            "Near-target(reads)", "Near-target rate (% of mapped reads)", "Near-target(Mean Depth)",
-            "Duplication rate", "Estimated Library Size", "Optical Duplicates",
-            "Unpaired Reads Examined", "Read Pairs Examined", "Unique on-target reads",
-            "qualimap_txt", "mosdepth_summary",
-        ]
+    # Add enrichment columns (use FRACTION internally; the displayed on-target is percent)
+    for r in rows:
+        try:
+            on_rate_pct = float(r.get("On-target rate (% of mapped reads)", "") or "nan")
+            on_rate_frac = on_rate_pct / 100.0 if on_rate_pct == on_rate_pct else float("nan")  # NaN check
+        except ValueError:
+            on_rate_frac = float("nan")
+        denom = (target_bp / genome_bp) if genome_bp > 0 else float("nan")
+        fold = (on_rate_frac / denom) if (denom and denom > 0) else float("nan")
+        r["Fold enrichment"] = f"{fold:.3f}" if (fold == fold) else ""  # NaN check
 
     # Write CSV
+    cols = [
+        "sample",
+        "Unmapped(reads)", "Total Mapped(reads)", "On-target(reads)", "Off-target(reads)",
+        "On-target rate (% of mapped reads)", "Off-target rate (% of mapped reads)",
+        "On-target (% of Total Reads)", "Fold enrichment",
+        "On-target(Mean Depth)",
+        "Near-target(reads)", "Near-target rate (% of mapped reads)", "Near-target(Mean Depth)",
+        "Duplication rate (total %)", "PCR Dup rate (%)", "Optical Dup rate (%)",
+        "Estimated Library Size", "Optical Duplicates",
+        "Unpaired Reads Examined", "Read Pairs Examined", "Unique on-target reads",
+        "qualimap_txt", "mosdepth_summary",
+    ]
     out_path = Path(args.out)
     with out_path.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
@@ -1043,8 +839,7 @@ Examples:
 
     print(f"Wrote {len(rows)} rows to {out_path}")
     print(f"Genome bp (from FAI): {genome_bp:,}")
-    if not wgs_mode and target_bp:
-        print(f"Target union bp (from BED∩FAI): {target_bp:,}")
+    print(f"Target union bp (from BED∩FAI): {target_bp:,}")
 
     # Generate duplication vs sequencing depth plot if requested
     if args.plot:
@@ -1053,7 +848,7 @@ Examples:
             print("[warn] matplotlib not installed. Skipping plot generation.")
             print("       Install with: pip install matplotlib")
         else:
-            generate_dup_vs_depth_plot(rows, args.plot, plt, wgs_mode)
+            generate_dup_vs_depth_plot(rows, args.plot, plt)
 
 
 if __name__ == "__main__":
